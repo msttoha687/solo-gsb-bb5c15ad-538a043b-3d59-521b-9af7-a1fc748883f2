@@ -13,8 +13,11 @@ from . import __version__, services
 from .database import init_db
 from .schemas import (
     AckRequest,
+    AlertAttributionOut,
     AlertOut,
     BatchReadingsResponse,
+    CustodyHandoverIn,
+    CustodyHandoverOut,
     CycleOut,
     LoggerBindingIn,
     LoggerBindingOut,
@@ -59,6 +62,9 @@ app = FastAPI(
         "另提供样本 × 记录仪温度一致性核查：对样本直接读数与当前归属的记录仪读数"
         "做不交叉一对一最优配对（配对数最多、总时间差最小、读数 ID 序列稳定取舍），"
         "返回温差超限配对明细与配对/未配对数量。"
+        "支持样本告警保管责任归属：按生效时间登记保管人交接（允许补录，同时刻唯一），"
+        "相邻交接形成左闭右开责任区间，告警归责按当前告警事件时间实时匹配，"
+        "恰在交接时刻归新保管人，查询即时反映最新重算结果。"
     ),
     version=__version__,
     lifespan=lifespan,
@@ -584,3 +590,59 @@ def check_logger_consistency(
     return services.logger_consistency_check(
         conn, sample_id, logger_id, max_time_diff_seconds, temp_diff_threshold_c
     )
+
+
+# ---------------- 保管人交接与告警归责 ----------------
+
+
+@app.post(
+    "/samples/{sample_id}/custody-handovers",
+    response_model=CustodyHandoverOut,
+    status_code=201,
+    tags=["custody"],
+)
+def create_custody_handover(
+    sample_id: str,
+    payload: CustodyHandoverIn,
+    conn=Depends(services.get_db_connection),
+):
+    """登记保管人交接（按生效时间；允许补录较早交接）。
+
+    同一样本同一时刻仅能登记一条，生效时刻重复时返回 409。
+    """
+
+    _require_sample(conn, sample_id)
+    try:
+        return services.create_custody_handover(
+            conn, sample_id, payload.custodian, payload.effective_time
+        )
+    except services.ValidationError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+
+
+@app.get(
+    "/samples/{sample_id}/custody-handovers",
+    response_model=list[CustodyHandoverOut],
+    tags=["custody"],
+)
+def list_custody_handovers(sample_id: str, conn=Depends(services.get_db_connection)):
+    """样本的交接记录列表（按生效时间升序，补录的较早交接排入正确位置）。"""
+
+    _require_sample(conn, sample_id)
+    return services.list_custody_handovers(conn, sample_id)
+
+
+@app.get(
+    "/samples/{sample_id}/alert-attribution",
+    response_model=list[AlertAttributionOut],
+    tags=["custody"],
+)
+def get_alert_attribution(sample_id: str, conn=Depends(services.get_db_connection)):
+    """样本告警归责查询：按当前告警的事件时间匹配左闭右开责任区间。
+
+    首条交接之前责任人为空；恰在交接时刻归新保管人。
+    查询时实时推导（不持久化），补录交接或告警重算后立即反映最新结果。
+    """
+
+    _require_sample(conn, sample_id)
+    return services.alert_attribution(conn, sample_id)

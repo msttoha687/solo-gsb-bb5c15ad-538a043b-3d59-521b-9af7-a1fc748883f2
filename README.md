@@ -20,6 +20,10 @@
 - 提供**样本 × 记录仪温度一致性核查**：取样本直接读数与当前有效归属的该记录仪读数，
   按事件时间顺序做**不交叉一对一配对**（配对数最多 → 总时间差最小 → 读数 ID 序列稳定取舍），
   返回温差严格大于阈值的配对明细与配对 / 两侧未配对数量；只读查询，不改写任何既有结果；
+- 支持**样本告警保管责任归属**：按生效时间登记保管人交接（允许补录较早交接，
+  同一样本同一时刻仅能登记一条），相邻交接形成**左闭右开责任区间**（首条之前责任人为空）；
+  告警归责按当前告警的事件时间实时匹配责任区间（恰在交接时刻归新保管人），
+  查询时即时推导、不持久化过期归责，既有告警确认语义保持不变；
 - 容器启动即自动初始化数据库（建表、索引），旧版本数据库自动兼容迁移。
 
 ## 目录结构
@@ -31,7 +35,7 @@ app/
   matching.py    # 纯函数一致性配对（不交叉一对一最优配对），不依赖 Web/DB
   database.py    # SQLite 连接与幂等建表脚本
   schemas.py     # Pydantic 请求/响应模型
-  services.py    # 业务层：幂等写入、时间重排重算、告警确认、一致性核查
+  services.py    # 业务层：幂等写入、时间重排重算、告警确认、一致性核查、保管交接与归责
 tests/           # pytest：引擎/配对单元测试 + API 集成测试
 examples/        # requests.http / demo.sh 示例请求
 Dockerfile
@@ -223,6 +227,44 @@ PATCH 样本的阈值、允许区间、循环上限、剂量预算或最大可�
 curl 'http://localhost:8000/samples/sample-demo-001/logger-consistency/logger-truck-07?max_time_diff_seconds=300&temp_diff_threshold_c=2.0'
 ```
 
+## 样本告警保管责任归属
+
+样本在冷链 / 仓储过程中可能多次更换保管人。服务支持按**生效时间**登记保管人交接，
+并把样本的每条**当前告警**归属到对应责任保管人：
+
+1. `POST /samples/{id}/custody-handovers` 登记交接：`custodian` + `effective_time`
+   （ISO 8601，无时区按 UTC 处理）。**允许补录较早交接**（生效时间可早于已登记的交接）；
+   **同一样本同一时刻仅能登记一条**（不同时区写法归一化为 UTC 后视为同一时刻），
+   重复提交返回 409；
+2. 相邻交接形成**左闭右开**责任区间 `[effective_time, 下一交接生效时间)`：
+   首条交接之前责任人为空（`custodian` / `handover_id` 为 `null`），
+   最后一条交接之后由该保管人负责到底；告警事件时间**恰好等于交接生效时刻**时
+   归新保管人；
+3. `GET /samples/{id}/alert-attribution` 返回样本当前全部告警的归责列表
+   （按告警事件时间升序）：`alert_id`、`event_time`、`custodian`、`handover_id`；
+4. 归责在**查询时实时推导**，不落库：**补录交接、迟到读数或配置变更引起告警重算后，
+   再次查询立即反映最新的交接记录与告警集合**，不会残留过期归责；
+   告警确认（ack）语义完全不变——确认状态不影响归责结果，归责查询也不改动确认状态；
+5. 删除样本会级联清理其交接记录。
+
+查询交接记录：`GET /samples/{id}/custody-handovers`（按生效时间升序，
+补录的较早交接自然排入正确位置）。
+
+示例：
+
+```bash
+# 登记交接（先 09:00 张三；再补录更早的 07:00 王五也可以）
+curl -X POST http://localhost:8000/samples/sample-demo-001/custody-handovers \
+  -H 'Content-Type: application/json' \
+  -d '{"custodian": "张三", "effective_time": "2026-09-20T09:00:00Z"}'
+
+# 交接记录列表（按生效时间升序）
+curl http://localhost:8000/samples/sample-demo-001/custody-handovers
+
+# 告警归责查询：返回每条当前告警的 告警ID / 事件时间 / 保管人 / 交接ID
+curl http://localhost:8000/samples/sample-demo-001/alert-attribution
+```
+
 ## 幂等去重
 
 - 提供 `event_id` 时：`(sample_id, event_id)` 唯一，重复提交直接跳过；
@@ -251,6 +293,8 @@ curl 'http://localhost:8000/samples/sample-demo-001/logger-consistency/logger-tr
 | POST/GET | `/loggers/{id}/invalid-periods` | 登记 / 查询记录仪**校准无效时段**（左闭右开；同一记录仪不重叠；时段内读数入库但不归属、不参与推导） |
 | GET/PATCH/DELETE | `/invalid-periods/{id}` | 时段详情 / 修改 / 删除（自动对账回算受影响样本；删除后有效读数恢复归属） |
 | GET | `/samples/{id}/logger-consistency/{logger_id}?max_time_diff_seconds=...&temp_diff_threshold_c=...` | **温度一致性核查**：直接读数与当前归属记录仪读数不交叉一对一最优配对，返回温差超限配对明细与配对/未配对数量（只读） |
+| POST/GET | `/samples/{id}/custody-handovers` | 登记保管人交接（按生效时间，允许补录较早交接；同时刻唯一，重复 409）/ 交接记录列表（按生效时间升序） |
+| GET | `/samples/{id}/alert-attribution` | **告警归责查询**：按当前告警事件时间匹配左闭右开责任区间（恰在交接时刻归新保管人），返回告警 ID、事件时间、保管人与交接 ID（查询时实时推导，不持久化） |
 | GET | `/samples/{id}/state` | **当前状态**、循环次数、双向暴露剂量/缺口/预算使用率、未确认告警数、最近读数 |
 | GET | `/samples/{id}/cycles` | **完整冻融循环明细** |
 | POST | `/samples/{id}/recompute` | 手动重算 |
@@ -397,7 +441,7 @@ curl -X DELETE http://localhost:8000/invalid-periods/1
 补齐（暴露剂量配置/缓存列、告警方向与剂量列、告警的记录仪读数引用列
 `alerts.logger_reading_id`），并补建共享记录仪相关表
 （`loggers` / `logger_readings` / `logger_bindings` / `reading_attributions` /
-`logger_invalid_periods`）。
+`logger_invalid_periods`）与保管人交接表（`custody_handovers`）。
 旧版本的 SQLite 数据文件无需手工处理即可平滑升级，历史样本与读数保留，
 首次重算后剂量缓存自动填充。
 
@@ -419,4 +463,8 @@ pytest -q
 最新归属反映、核查只读不改写既有结果、参数校验（负值 422、缺失 422、不存在 404）；
 校准无效时段部分覆盖时段增删改查与重叠/倒挂/端点相接校验、时段内读数照常幂等入库
 但不归属样本且不参与冻融/剂量/告警/一致性核查、迟到读数与时段 PATCH/DELETE 后的
-归属对账与恢复、直接读数与既有告警确认状态保留、逐记录仪隔离与删除级联。
+归属对账与恢复、直接读数与既有告警确认状态保留、逐记录仪隔离与删除级联；
+保管责任归属部分覆盖交接登记与补录排序、同时刻唯一（409）、参数校验（422）、
+样本不存在（404）、左闭右开责任区间（首条之前责任人为空、恰在交接时刻归新保管人、
+末条之后归最后保管人）、补录交接与迟到读数重算后归责查询即时反映最新结果
+（不残留过期归责）、告警确认语义不受影响、删除样本级联清理交接记录。

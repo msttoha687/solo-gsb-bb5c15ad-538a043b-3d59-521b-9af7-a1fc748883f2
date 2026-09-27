@@ -160,6 +160,22 @@ CREATE TABLE IF NOT EXISTS logger_invalid_periods (
 
 CREATE INDEX IF NOT EXISTS idx_invalid_periods_logger
     ON logger_invalid_periods(logger_id, start_time, end_time);
+
+-- 保管人交接：按生效时间登记（允许补录较早交接），同一样本同一时刻仅能登记一条。
+-- 相邻交接形成左闭右开责任区间（首条之前责任人为空）；告警归责在查询时
+-- 按当前告警的事件时间实时匹配，不持久化，因此无需随重算维护派生表。
+CREATE TABLE IF NOT EXISTS custody_handovers (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    sample_id      TEXT NOT NULL REFERENCES samples(id) ON DELETE CASCADE,
+    custodian      TEXT NOT NULL,
+    effective_time TEXT NOT NULL,
+    created_at     TEXT NOT NULL,
+    -- 同一样本同一时刻仅能登记一条交接
+    UNIQUE(sample_id, effective_time)
+);
+
+CREATE INDEX IF NOT EXISTS idx_custody_handovers_sample_time
+    ON custody_handovers(sample_id, effective_time, id);
 """
 
 

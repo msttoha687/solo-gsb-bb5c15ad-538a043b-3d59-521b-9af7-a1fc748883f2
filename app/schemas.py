@@ -172,6 +172,36 @@ class AckRequest(BaseModel):
     acknowledged: bool = True
 
 
+# ---------------- 保管人交接与告警归责 ----------------
+
+
+class CustodyHandoverIn(BaseModel):
+    custodian: str = Field(..., min_length=1, max_length=128, description="接管保管人姓名/标识")
+    effective_time: datetime = Field(
+        ...,
+        description="交接生效时间（含，左闭；ISO 8601，无时区按 UTC 处理）；允许补录较早交接",
+    )
+
+
+class CustodyHandoverOut(BaseModel):
+    model_config = {"from_attributes": True}
+
+    id: int
+    sample_id: str
+    custodian: str
+    effective_time: datetime
+    created_at: datetime
+
+
+class AlertAttributionOut(BaseModel):
+    """单条当前告警的归责结果（查询时按责任区间实时推导，不持久化）。"""
+
+    alert_id: int = Field(..., description="告警 ID（alerts.id）")
+    event_time: datetime = Field(..., description="告警事件时间")
+    custodian: Optional[str] = Field(None, description="责任保管人；首条交接之前为 null")
+    handover_id: Optional[int] = Field(None, description="对应交接记录 ID；无责任人为 null")
+
+
 # ---------------- 响应模型 ----------------
 
 

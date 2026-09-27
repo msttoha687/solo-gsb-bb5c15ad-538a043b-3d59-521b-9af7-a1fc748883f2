@@ -11,6 +11,12 @@
 从而不参与冻融循环、暴露剂量、告警与温度一致性核查；
 时段的新增 / 修改 / 删除都会对绑定该记录仪的样本重新对账并回算，
 删除时段后有效读数恢复归属。
+
+保管人交接（``custody_handovers``）：按生效时间登记（允许补录较早交接，
+同一样本同一时刻仅一条）。相邻交接形成左闭右开责任区间，首条之前责任人为空。
+告警归责在查询时按当前告警的事件时间实时匹配责任区间
+（恰在交接时刻归新保管人），不持久化派生归责，
+因此补录交接或迟到读数引起告警重算后，查询立即反映最新结果。
 """
 
 from __future__ import annotations
@@ -18,6 +24,7 @@ from __future__ import annotations
 import sqlite3
 import threading
 import uuid
+from bisect import bisect_right
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -1230,6 +1237,100 @@ def logger_consistency_check(
             for p in anomalies
         ],
     }
+
+
+# ---------------- 保管人交接与告警归责 ----------------
+
+
+def create_custody_handover(
+    conn: sqlite3.Connection,
+    sample_id: str,
+    custodian: str,
+    effective_time: datetime,
+) -> sqlite3.Row:
+    """登记保管人交接（按生效时间；允许补录较早交接）。
+
+    同一样本同一时刻仅能登记一条；与既有交接生效时刻重复时抛出
+    ``ValidationError``（路由层映射为 409）。
+    """
+
+    effective_iso = to_utc_iso(effective_time)
+    with _write_lock:
+        dup = conn.execute(
+            "SELECT id FROM custody_handovers WHERE sample_id = ? AND effective_time = ?",
+            (sample_id, effective_iso),
+        ).fetchone()
+        if dup is not None:
+            raise ValidationError(
+                f"该样本在 {effective_iso} 已存在交接记录（handover_id={dup['id']}），"
+                "同一样本同一时刻仅能登记一条"
+            )
+        cur = conn.execute(
+            """
+            INSERT INTO custody_handovers (sample_id, custodian, effective_time, created_at)
+            VALUES (?, ?, ?, ?)
+            """,
+            (sample_id, custodian, effective_iso, utcnow_iso()),
+        )
+        handover_id = cur.lastrowid
+        conn.commit()
+    row = get_custody_handover(conn, handover_id)
+    assert row is not None
+    return row
+
+
+def get_custody_handover(
+    conn: sqlite3.Connection, handover_id: int
+) -> Optional[sqlite3.Row]:
+    return conn.execute(
+        "SELECT * FROM custody_handovers WHERE id = ?", (handover_id,)
+    ).fetchone()
+
+
+def list_custody_handovers(
+    conn: sqlite3.Connection, sample_id: str
+) -> list[sqlite3.Row]:
+    """按生效时间升序列出样本的交接记录（补录的较早交接自然排入正确位置）。"""
+
+    return list(
+        conn.execute(
+            "SELECT * FROM custody_handovers WHERE sample_id = ? "
+            "ORDER BY effective_time, id",
+            (sample_id,),
+        )
+    )
+
+
+def alert_attribution(conn: sqlite3.Connection, sample_id: str) -> list[dict]:
+    """样本当前告警的保管责任归属（查询时实时推导，不持久化）。
+
+    相邻交接形成左闭右开责任区间 ``[effective_time, 下一交接生效时间)``：
+    首条交接之前责任人为空；告警事件时间恰好等于交接生效时刻时归新保管人；
+    最后一条交接之后由该保管人负责到底。告警集合随重算实时更新
+    （迟到读数、配置变更后陈旧告警已清除），补录交接也立即反映到本查询，
+    因此不会返回过期归责。
+    """
+
+    handovers = list_custody_handovers(conn, sample_id)
+    times = [h["effective_time"] for h in handovers]
+    alerts = conn.execute(
+        "SELECT id, event_time FROM alerts WHERE sample_id = ? ORDER BY event_time, id",
+        (sample_id,),
+    ).fetchall()
+    attribution: list[dict] = []
+    for alert in alerts:
+        # bisect_right：恰在交接生效时刻归新保管人（左闭区间）
+        idx = bisect_right(times, alert["event_time"]) - 1
+        handover = handovers[idx] if idx >= 0 else None
+        attribution.append(
+            {
+                "alert_id": alert["id"],
+                "event_time": alert["event_time"],
+                "custodian": handover["custodian"] if handover else None,
+                "handover_id": handover["id"] if handover else None,
+            }
+        )
+    return attribution
 
 
 def get_db_connection() -> sqlite3.Connection:
