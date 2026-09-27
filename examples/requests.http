@@ -141,3 +141,21 @@ Content-Type: application/json
 
 ### 19. 删除无效时段（原时段内有效读数恢复归属，受影响样本自动回算）
 DELETE {{baseUrl}}/invalid-periods/1
+
+### 20. 登记保管人交接（按生效时间；允许补录较早交接，同时刻仅一条）
+POST {{baseUrl}}/samples/{{sampleId}}/custody-handovers
+Content-Type: application/json
+
+{"custodian": "张三", "effective_time": "2026-09-20T09:00:00Z", "note": "早班接管"}
+
+### 21. 补录更早的交接（08:00 李四）
+POST {{baseUrl}}/samples/{{sampleId}}/custody-handovers
+Content-Type: application/json
+
+{"custodian": "李四", "effective_time": "2026-09-20T08:00:00Z"}
+
+### 22. 交接记录列表（按生效时间升序）
+GET {{baseUrl}}/samples/{{sampleId}}/custody-handovers
+
+### 23. 告警归责查询（当前告警按事件时间匹配左闭右开责任区间；查询时计算，不持久化）
+GET {{baseUrl}}/samples/{{sampleId}}/alert-custody

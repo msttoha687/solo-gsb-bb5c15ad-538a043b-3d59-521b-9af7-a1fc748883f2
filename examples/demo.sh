@@ -102,3 +102,15 @@ echo "== 删除无效时段（有效读数恢复归属，样本自动回算）==
 PID=$(curl -sS "$BASE/loggers/logger-truck-07/invalid-periods" | python3 -c 'import json,sys; print(json.load(sys.stdin)[0]["id"])')
 curl -sS -X DELETE "$BASE/invalid-periods/$PID"; echo
 curl -sS "$BASE/samples/$SID/readings?source=logger"; echo
+
+echo "== 登记保管人交接（09:00 张三；再补录更早的 08:00 李四）=="
+curl -sS -X POST "$BASE/samples/$SID/custody-handovers" -H 'Content-Type: application/json' \
+  -d '{"custodian": "张三", "effective_time": "2026-09-20T09:00:00Z", "note": "早班接管"}'; echo
+curl -sS -X POST "$BASE/samples/$SID/custody-handovers" -H 'Content-Type: application/json' \
+  -d '{"custodian": "李四", "effective_time": "2026-09-20T08:00:00Z"}'; echo
+
+echo "== 交接记录列表（按生效时间升序）=="
+curl -sS "$BASE/samples/$SID/custody-handovers"; echo
+
+echo "== 告警归责查询（当前告警按事件时间匹配左闭右开责任区间）=="
+curl -sS "$BASE/samples/$SID/alert-custody"; echo
